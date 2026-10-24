@@ -1,0 +1,1345 @@
+#!/usr/bin/env bash
+#
+# claude-box / agent-box — run Claude Code or Codex in a rootless Podman sandbox.
+# Usage: agent-box [claude|codex] [wrapper flags] [agent arguments]
+#        agent-box skill|tool install|list|remove ...
+#
+# Wrapper flags must appear before Claude Code arguments:
+#   --box-shell
+#   --box-info
+#   --git-mode readonly|readwrite
+#   --saia [MODEL]
+#   --saia-models
+#   --bifrost [MODEL]
+#   --bifrost-models
+#   --bifrost-quota
+#
+set -euo pipefail
+
+PROGNAME=${0##*/}
+
+die() {
+    printf '%s: %s\n' "$PROGNAME" "$*" >&2
+    exit 1
+}
+
+# ---------------------------------------------------------------- defaults ---
+
+: "${CLAUDE_BOX_IMAGE:=localhost/claude-box:latest}"
+: "${CLAUDE_BOX_STATE:=${XDG_DATA_HOME:-$HOME/.local/share}/claude-box}"
+: "${CLAUDE_BOX_CONFIG:=${XDG_CONFIG_HOME:-$HOME/.config}/claude-box/config}"
+: "${CLAUDE_BOX_TOKEN_FILE:=${XDG_CONFIG_HOME:-$HOME/.config}/claude-box/token}"
+: "${CLAUDE_BOX_CODEX_AUTH_DIR:=${XDG_CONFIG_HOME:-$HOME/.config}/claude-box/codex}"
+: "${CLAUDE_BOX_SAIA_KEY_FILE:=${XDG_CONFIG_HOME:-$HOME/.config}/claude-box/saia-key}"
+: "${CLAUDE_BOX_BIFROST_KEY_FILE:=${XDG_CONFIG_HOME:-$HOME/.config}/claude-box/bifrost-key}"
+: "${CLAUDE_BOX_NETWORK:=}"
+: "${CLAUDE_BOX_MOUNT_AT:=}"
+
+FIREWALL=1
+NET_ALLOW=()
+READ_ONLY=0
+GIT_MODE=readonly
+PIDS_LIMIT=4096
+MEMORY_LIMIT=
+TMP_SIZE=2g
+EXTRA_MOUNTS=()
+EXTRA_PROTECTED=()
+PUBLISH=()
+ALLOW_PTRACE=0
+PERMISSION_MODE=bypassPermissions
+
+# SAIA settings.
+SAIA_URL=https://chat-ai.academiccloud.de/v1
+SAIA_MODELS_URL=
+SAIA_MODEL=
+
+# Explicit override. Empty means: try gateway metadata, then use the fallback.
+SAIA_CONTEXT_TOKENS=
+SAIA_DEFAULT_CONTEXT_TOKENS=32768
+
+SAIA_MAX_OUTPUT_TOKENS=8192
+SAIA_PROXY_UID=61234
+SAIA_PROXY_PORT=47821
+
+# Bifrost settings. No deployment-specific endpoint or model is built in.
+BIFROST_URL=
+BIFROST_MODELS_URL=
+BIFROST_MODEL=
+
+# Explicit override. Empty means: try gateway metadata, then use the fallback.
+BIFROST_CONTEXT_TOKENS=
+BIFROST_DEFAULT_CONTEXT_TOKENS=32768
+
+BIFROST_MAX_OUTPUT_TOKENS=8192
+BIFROST_PROXY_UID=61234
+BIFROST_PROXY_PORT=47821
+BIFROST_CA_FILE=
+BIFROST_QUOTA_URL=
+BIFROST_QUOTA_HEADER=x-bf-vk
+
+if [ -r "$CLAUDE_BOX_CONFIG" ]; then
+    # This is a trusted shell configuration file.
+    # shellcheck source=/dev/null
+    . "$CLAUDE_BOX_CONFIG"
+fi
+
+EXTENSIONS_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/agent-box-extensions.py"
+case "${1:-}" in
+    skill|tool)
+        command -v python3 >/dev/null 2>&1 || die "extension management requires Python 3 on the host"
+        [ -r "$EXTENSIONS_HELPER" ] || die "install agent-box-extensions.py beside the launcher"
+        exec python3 "$EXTENSIONS_HELPER" "$CLAUDE_BOX_STATE/shared" "$@"
+        ;;
+esac
+
+AGENT=claude
+case "${1:-}" in
+    claude|codex)
+        AGENT=$1
+        shift
+        ;;
+esac
+
+# An explicit environment variable takes precedence over the token file.
+if [ "$AGENT" = claude ] && [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] &&
+   [ -r "$CLAUDE_BOX_TOKEN_FILE" ]; then
+    CLAUDE_CODE_OAUTH_TOKEN=$(
+        tr -d '[:space:]' < "$CLAUDE_BOX_TOKEN_FILE"
+    )
+fi
+
+# ------------------------------------------------------------ wrapper flags ---
+
+BOX_SHELL=0
+BOX_INFO=0
+SAIA=0
+SAIA_LIST=0
+BIFROST=0
+BIFROST_LIST=0
+BIFROST_QUOTA=0
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --box-shell)
+            BOX_SHELL=1
+            shift
+            ;;
+        --box-info)
+            BOX_INFO=1
+            shift
+            ;;
+        --git-mode)
+            [ "$#" -ge 2 ] || die "--git-mode requires readonly or readwrite"
+            GIT_MODE=$2
+            shift 2
+            ;;
+        --saia-models)
+            SAIA_LIST=1
+            shift
+            ;;
+        --saia=*)
+            SAIA=1
+            SAIA_MODEL=${1#--saia=}
+            shift
+            ;;
+        --saia)
+            SAIA=1
+            shift
+            if [ "$#" -gt 0 ] && [ "${1#-}" = "$1" ]; then
+                SAIA_MODEL=$1
+                shift
+            fi
+            ;;
+        --bifrost-models)
+            BIFROST_LIST=1
+            shift
+            ;;
+        --bifrost-quota)
+            BIFROST_QUOTA=1
+            shift
+            ;;
+        --bifrost=*)
+            BIFROST=1
+            BIFROST_MODEL=${1#--bifrost=}
+            shift
+            ;;
+        --bifrost)
+            BIFROST=1
+            shift
+            if [ "$#" -gt 0 ] && [ "${1#-}" = "$1" ]; then
+                BIFROST_MODEL=$1
+                shift
+            fi
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+case "$GIT_MODE" in
+    readonly|readwrite) ;;
+    *) die "GIT_MODE must be readonly or readwrite" ;;
+esac
+
+if [ "$AGENT" = codex ] &&
+   { [ "$SAIA" = 1 ] || [ "$SAIA_LIST" = 1 ] ||
+     [ "$BIFROST" = 1 ] || [ "$BIFROST_LIST" = 1 ] ||
+     [ "$BIFROST_QUOTA" = 1 ]; }; then
+    die "SAIA/Bifrost wrapper options currently support Claude only"
+fi
+
+if { [ "$SAIA" = 1 ] || [ "$SAIA_LIST" = 1 ]; } &&
+   { [ "$BIFROST" = 1 ] || [ "$BIFROST_LIST" = 1 ] ||
+     [ "$BIFROST_QUOTA" = 1 ]; }; then
+    die "SAIA and Bifrost options cannot be combined"
+fi
+
+# -------------------------------------------------------------- validation ---
+
+valid_url() {
+    [[ "$1" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~!$%\&\'\(\)*+,;=:@/-]*)?$ ]]
+}
+
+valid_model() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}$ ]]
+}
+
+valid_integer() {
+    [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+# ------------------------------------------------------- gateway selection ---
+
+GATEWAY=0
+GATEWAY_KIND=
+GATEWAY_URL=
+GATEWAY_MODELS_URL=
+GATEWAY_MODEL=
+GATEWAY_CONTEXT=
+GATEWAY_DEFAULT_CONTEXT=
+GATEWAY_MAX_OUTPUT=
+GATEWAY_PROXY_UID=
+GATEWAY_PROXY_PORT=
+GATEWAY_CA_FILE=
+GATEWAY_KEY=
+GATEWAY_KEY_SOURCE=
+GATEWAY_HOME_SUFFIX=
+
+if [ "$SAIA" = 1 ]; then
+    GATEWAY=1
+    GATEWAY_KIND=SAIA
+    GATEWAY_URL=$SAIA_URL
+    GATEWAY_MODELS_URL=${SAIA_MODELS_URL:-${SAIA_URL%/}/models}
+    GATEWAY_MODEL=$SAIA_MODEL
+    GATEWAY_CONTEXT=$SAIA_CONTEXT_TOKENS
+    GATEWAY_DEFAULT_CONTEXT=$SAIA_DEFAULT_CONTEXT_TOKENS
+    GATEWAY_MAX_OUTPUT=$SAIA_MAX_OUTPUT_TOKENS
+    GATEWAY_PROXY_UID=$SAIA_PROXY_UID
+    GATEWAY_PROXY_PORT=$SAIA_PROXY_PORT
+    GATEWAY_CA_FILE=
+    GATEWAY_HOME_SUFFIX=saia
+fi
+
+if [ "$BIFROST" = 1 ]; then
+    GATEWAY=1
+    GATEWAY_KIND=Bifrost
+    GATEWAY_URL=$BIFROST_URL
+    GATEWAY_MODELS_URL=${BIFROST_MODELS_URL:-${BIFROST_URL%/}/models}
+    GATEWAY_MODEL=$BIFROST_MODEL
+    GATEWAY_CONTEXT=$BIFROST_CONTEXT_TOKENS
+    GATEWAY_DEFAULT_CONTEXT=$BIFROST_DEFAULT_CONTEXT_TOKENS
+    GATEWAY_MAX_OUTPUT=$BIFROST_MAX_OUTPUT_TOKENS
+    GATEWAY_PROXY_UID=$BIFROST_PROXY_UID
+    GATEWAY_PROXY_PORT=$BIFROST_PROXY_PORT
+    GATEWAY_CA_FILE=$BIFROST_CA_FILE
+    GATEWAY_HOME_SUFFIX=bifrost
+fi
+
+# ------------------------------------------------------------- credentials ---
+
+if [ "$SAIA" = 1 ] || [ "$SAIA_LIST" = 1 ]; then
+    if [ -n "${SAIA_API_KEY:-}" ]; then
+        GATEWAY_KEY=$SAIA_API_KEY
+        GATEWAY_KEY_SOURCE=SAIA_API_KEY
+    elif [ -r "$CLAUDE_BOX_SAIA_KEY_FILE" ]; then
+        GATEWAY_KEY=$(tr -d '[:space:]' < "$CLAUDE_BOX_SAIA_KEY_FILE")
+        GATEWAY_KEY_SOURCE=$CLAUDE_BOX_SAIA_KEY_FILE
+    fi
+fi
+
+if [ "$BIFROST" = 1 ] ||
+   [ "$BIFROST_LIST" = 1 ] ||
+   [ "$BIFROST_QUOTA" = 1 ]; then
+    if [ -n "${BIFROST_KEY:-}" ]; then
+        GATEWAY_KEY=$BIFROST_KEY
+        GATEWAY_KEY_SOURCE=BIFROST_KEY
+    elif [ -r "$CLAUDE_BOX_BIFROST_KEY_FILE" ]; then
+        GATEWAY_KEY=$(tr -d '[:space:]' < "$CLAUDE_BOX_BIFROST_KEY_FILE")
+        GATEWAY_KEY_SOURCE=$CLAUDE_BOX_BIFROST_KEY_FILE
+    fi
+fi
+
+# Validate SAIA settings.
+if [ "$SAIA" = 1 ] || [ "$SAIA_LIST" = 1 ]; then
+    valid_url "$SAIA_URL" ||
+        die "SAIA_URL must be a plain HTTP(S) URL: $SAIA_URL"
+
+    if [ -n "$SAIA_MODELS_URL" ]; then
+        valid_url "$SAIA_MODELS_URL" ||
+            die "SAIA_MODELS_URL must be a plain HTTP(S) URL"
+    fi
+fi
+
+# Validate Bifrost settings.
+if [ "$BIFROST" = 1 ] ||
+   [ "$BIFROST_LIST" = 1 ] ||
+   [ "$BIFROST_QUOTA" = 1 ]; then
+    [ -n "$BIFROST_URL" ] ||
+        die "BIFROST_URL is not configured; set it in $CLAUDE_BOX_CONFIG"
+
+    valid_url "$BIFROST_URL" ||
+        die "BIFROST_URL must be a plain HTTP(S) URL: $BIFROST_URL"
+
+    if [ -n "$BIFROST_MODELS_URL" ]; then
+        valid_url "$BIFROST_MODELS_URL" ||
+            die "BIFROST_MODELS_URL must be a plain HTTP(S) URL"
+    fi
+
+    if [ -n "$BIFROST_CA_FILE" ]; then
+        [ -f "$BIFROST_CA_FILE" ] ||
+            die "BIFROST_CA_FILE is not a regular file: $BIFROST_CA_FILE"
+        [ -r "$BIFROST_CA_FILE" ] ||
+            die "BIFROST_CA_FILE is not readable: $BIFROST_CA_FILE"
+    fi
+fi
+
+if [ "$BIFROST_QUOTA" = 1 ]; then
+    [ -n "$BIFROST_QUOTA_URL" ] ||
+        die "BIFROST_QUOTA_URL is not configured"
+
+    valid_url "$BIFROST_QUOTA_URL" ||
+        die "BIFROST_QUOTA_URL must be a plain HTTP(S) URL"
+
+    [[ "$BIFROST_QUOTA_HEADER" =~ ^[A-Za-z0-9-]+$ ]] ||
+        die "BIFROST_QUOTA_HEADER is not a valid HTTP header name"
+fi
+
+if [ "$GATEWAY" = 1 ]; then
+    [ -n "$GATEWAY_MODEL" ] ||
+        die "--$GATEWAY_HOME_SUFFIX needs a model id or a configured default model"
+
+    valid_model "$GATEWAY_MODEL" ||
+        die "not a valid model id: '$GATEWAY_MODEL'"
+
+    for number in \
+        "$GATEWAY_MAX_OUTPUT" \
+        "$GATEWAY_DEFAULT_CONTEXT" \
+        "$GATEWAY_PROXY_UID" \
+        "$GATEWAY_PROXY_PORT" \
+        ${GATEWAY_CONTEXT:+"$GATEWAY_CONTEXT"}
+    do
+        valid_integer "$number" ||
+            die "gateway numeric settings must be plain integers: '$number'"
+    done
+
+    [ "$GATEWAY_DEFAULT_CONTEXT" -gt 0 ] ||
+        die "gateway default context size must be greater than zero"
+
+    [ "$GATEWAY_PROXY_UID" -ne 0 ] ||
+        die "gateway proxy UID must not be 0"
+
+    [ "$GATEWAY_PROXY_UID" -ne "$(id -u)" ] ||
+        die "gateway proxy UID must differ from your UID"
+fi
+
+if { [ "$SAIA_LIST" = 1 ] ||
+     [ "$BIFROST_LIST" = 1 ] ||
+     [ "$BIFROST_QUOTA" = 1 ]; } &&
+   [ -z "$GATEWAY_KEY" ]; then
+    die "no gateway API key was found"
+fi
+
+if [ "$GATEWAY" = 1 ] &&
+   [ -z "$GATEWAY_KEY" ] &&
+   [ "$BOX_INFO" = 0 ]; then
+    if [ "$GATEWAY_KIND" = SAIA ]; then
+        die "no SAIA key: set SAIA_API_KEY or create $CLAUDE_BOX_SAIA_KEY_FILE"
+    else
+        die "no Bifrost key: set BIFROST_KEY or create $CLAUDE_BOX_BIFROST_KEY_FILE"
+    fi
+fi
+
+# ---------------------------------------------------------------- sanity -----
+
+[ "$(id -u)" -ne 0 ] ||
+    die "run as your normal user, not root"
+
+command -v podman >/dev/null 2>&1 ||
+    die "podman not found"
+
+podman image exists "$CLAUDE_BOX_IMAGE" 2>/dev/null ||
+    die "image not found: $CLAUDE_BOX_IMAGE
+  build it with: podman build -t claude-box:latest -f Containerfile ."
+
+[ "$CLAUDE_BOX_NETWORK" != host ] ||
+    die "CLAUDE_BOX_NETWORK=host would expose host services; refusing"
+
+# ----------------------------------------------------- gateway HTTP helper ---
+
+gateway_http_container() {
+    local url=$1
+    local header_name=$2
+    local output_mode=$3
+    local ca_file=${4:-}
+    local -a run_options
+
+    export CB_GATEWAY_KEY="$GATEWAY_KEY"
+    export CB_GATEWAY_REQUEST_URL="$url"
+    export CB_GATEWAY_HEADER_NAME="$header_name"
+    export CB_GATEWAY_OUTPUT_MODE="$output_mode"
+
+    run_options=(
+        --rm
+        --userns=keep-id
+        --cap-drop=ALL
+        --security-opt no-new-privileges
+        --env CB_GATEWAY_KEY
+        --env CB_GATEWAY_REQUEST_URL
+        --env CB_GATEWAY_HEADER_NAME
+        --env CB_GATEWAY_OUTPUT_MODE
+        --entrypoint /bin/bash
+    )
+
+    if [ -n "$CLAUDE_BOX_NETWORK" ]; then
+        run_options+=(--network "$CLAUDE_BOX_NETWORK")
+    fi
+
+    if [ -n "$ca_file" ]; then
+        run_options+=(
+            --volume "$ca_file:/run/claude-box-gateway-ca.pem:ro"
+            --env "CB_GATEWAY_CA=/run/claude-box-gateway-ca.pem"
+        )
+    fi
+
+    podman run "${run_options[@]}" "$CLAUDE_BOX_IMAGE" -c '
+        set -euo pipefail
+
+        curl_options=(-fsS --max-time 30 -H @-)
+
+        if [ -n "${CB_GATEWAY_CA:-}" ]; then
+            curl_options+=(--cacert "$CB_GATEWAY_CA")
+        fi
+
+        if [ "$CB_GATEWAY_OUTPUT_MODE" = models ]; then
+            printf "%s: Bearer %s\n" \
+                "$CB_GATEWAY_HEADER_NAME" "$CB_GATEWAY_KEY" |
+                curl "${curl_options[@]}" "$CB_GATEWAY_REQUEST_URL" |
+                jq -r "
+                    [\"MODEL\", \"CONTEXT\"],
+                    (
+                        .data
+                        | sort_by(.id)[]
+                        | [
+                            .id,
+                            (
+                                .max_model_len
+                                // .context_length
+                                // \"?\"
+                                | tostring
+                            )
+                          ]
+                    )
+                    | @tsv
+                " |
+                awk -F "\t" \
+                    "{ printf \"%-52s %s\\n\", \$1, \$2 }"
+        else
+            printf "%s: %s\n" \
+                "$CB_GATEWAY_HEADER_NAME" "$CB_GATEWAY_KEY" |
+                curl "${curl_options[@]}" "$CB_GATEWAY_REQUEST_URL" |
+                jq .
+        fi
+    '
+}
+
+if [ "$SAIA_LIST" = 1 ]; then
+    GATEWAY_MODELS_URL=${SAIA_MODELS_URL:-${SAIA_URL%/}/models}
+
+    gateway_http_container \
+        "$GATEWAY_MODELS_URL" Authorization models "" ||
+        die "could not list SAIA models"
+
+    exit 0
+fi
+
+if [ "$BIFROST_LIST" = 1 ]; then
+    GATEWAY_MODELS_URL=${BIFROST_MODELS_URL:-${BIFROST_URL%/}/models}
+
+    gateway_http_container \
+        "$GATEWAY_MODELS_URL" Authorization models "$BIFROST_CA_FILE" ||
+        die "could not list Bifrost models"
+
+    exit 0
+fi
+
+if [ "$BIFROST_QUOTA" = 1 ]; then
+    gateway_http_container \
+        "$BIFROST_QUOTA_URL" \
+        "$BIFROST_QUOTA_HEADER" \
+        json \
+        "$BIFROST_CA_FILE" ||
+        die "could not query the Bifrost quota endpoint"
+
+    exit 0
+fi
+
+# --------------------------------------------------------------- project -----
+
+PROJECT=$(pwd -P)
+
+[ "$PROJECT" != / ] ||
+    die "refusing to share the filesystem root"
+
+canon() {
+    if [ -d "$1" ]; then
+        (
+            cd "$1"
+            pwd -P
+        )
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
+case "$(canon "$HOME")/" in
+    "$PROJECT"/*)
+        die "refusing to share $PROJECT: it contains your home directory"
+        ;;
+esac
+
+PROTECTED=(
+    "$CLAUDE_BOX_STATE"
+    "${CLAUDE_BOX_CONFIG%/*}"
+    "${CLAUDE_BOX_TOKEN_FILE%/*}"
+    "$CLAUDE_BOX_CODEX_AUTH_DIR"
+    "${CLAUDE_BOX_SAIA_KEY_FILE%/*}"
+    "${CLAUDE_BOX_BIFROST_KEY_FILE%/*}"
+    "$HOME/.ssh"
+    "$HOME/.gnupg"
+    "$HOME/.aws"
+    "$HOME/.kube"
+    "$HOME/.docker"
+    "$HOME/.codex"
+    "$HOME/.config"
+    "$HOME/.local"
+    ${EXTRA_PROTECTED[@]+"${EXTRA_PROTECTED[@]}"}
+)
+
+for protected_path in "${PROTECTED[@]}"; do
+    protected_path=$(canon "$protected_path")
+
+    case "$PROJECT/" in
+        "$protected_path"/*)
+            die "refusing to run inside $protected_path"
+            ;;
+    esac
+
+    case "$protected_path/" in
+        "$PROJECT"/*)
+            die "refusing to share $PROJECT: it contains $protected_path"
+            ;;
+    esac
+done
+
+# ---------------------------------------------------------- sandbox home -----
+
+PROJECT_ID=$(printf '%s' "$PROJECT" | cksum | cut -d' ' -f1)
+BOX_HOME="$CLAUDE_BOX_STATE/projects/$PROJECT_ID"
+
+if [ "$AGENT" = codex ]; then
+    BOX_HOME="$BOX_HOME-codex"
+fi
+
+if [ "$GATEWAY" = 1 ]; then
+    BOX_HOME="$BOX_HOME-$GATEWAY_HOME_SUFFIX"
+fi
+
+mkdir -p "$BOX_HOME"
+chmod 700 "$CLAUDE_BOX_STATE" "$BOX_HOME"
+printf '%s\n' "$PROJECT" > "$BOX_HOME/.project-path"
+
+if [ "$AGENT" = claude ] &&
+   { [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] ||
+     [ "$GATEWAY" = 1 ]; } &&
+   [ ! -e "$BOX_HOME/.claude.json" ]; then
+    printf '{"hasCompletedOnboarding":true}\n' > "$BOX_HOME/.claude.json"
+fi
+
+if [ "$AGENT" = claude ] && [ ! -e "$BOX_HOME/.claude/settings.json" ]; then
+    mkdir -p "$BOX_HOME/.claude"
+
+    cat > "$BOX_HOME/.claude/settings.json" <<'JSON'
+{
+  "permissions": {
+    "defaultMode": "bypassPermissions"
+  },
+  "skipDangerousModePermissionPrompt": true,
+  "env": {
+    "DISABLE_AUTOUPDATER": "1"
+  }
+}
+JSON
+fi
+
+if [ "$AGENT" = codex ] && [ ! -e "$BOX_HOME/.codex/config.toml" ]; then
+    mkdir -p "$BOX_HOME/.codex"
+    # The Podman container supplies the outer sandbox, as for Claude.
+    cat > "$BOX_HOME/.codex/config.toml" <<'TOML'
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+cli_auth_credentials_store = "file"
+TOML
+fi
+
+# ---------------------------------------------------------------- mounts -----
+
+LABEL=""
+
+if command -v selinuxenabled >/dev/null 2>&1 &&
+   selinuxenabled 2>/dev/null; then
+    LABEL=",Z"
+fi
+
+if [ -n "$CLAUDE_BOX_MOUNT_AT" ]; then
+    PROJECT_IN=$CLAUDE_BOX_MOUNT_AT
+else
+    PROJECT_IN=$PROJECT
+fi
+
+MOUNTS=(
+    --volume "$PROJECT:$PROJECT_IN:rw$LABEL"
+    --volume "$BOX_HOME:/claude:rw$LABEL"
+    --volume /etc/localtime:/etc/localtime:ro
+)
+
+CODEX_AUTH_ONLY=0
+
+if [ "$AGENT" = codex ]; then
+    mkdir -p "$CLAUDE_BOX_CODEX_AUTH_DIR"
+    chmod 700 "$CLAUDE_BOX_CODEX_AUTH_DIR"
+    if [ ! -e "$CLAUDE_BOX_CODEX_AUTH_DIR/auth.json" ]; then
+        (umask 077; set -C; printf '{}\n' > "$CLAUDE_BOX_CODEX_AUTH_DIR/auth.json") 2>/dev/null ||
+            [ -f "$CLAUDE_BOX_CODEX_AUTH_DIR/auth.json" ] || die "cannot create shared Codex auth.json"
+    fi
+    chmod 600 "$CLAUDE_BOX_CODEX_AUTH_DIR/auth.json"
+
+    # Login/logout must be able to create or remove the credential file.
+    # Other commands share only that file, retaining project-local settings/state.
+    if [ "$BOX_SHELL" = 0 ] &&
+       { [ "${1:-}" = login ] || [ "${1:-}" = logout ]; }; then
+        CODEX_AUTH_ONLY=1
+        MOUNTS+=(--volume "$CLAUDE_BOX_CODEX_AUTH_DIR:/claude/.codex:rw${LABEL:+,z}")
+    else
+        MOUNTS+=(--volume "$CLAUDE_BOX_CODEX_AUTH_DIR/auth.json:/claude/.codex/auth.json:rw${LABEL:+,z}")
+    fi
+fi
+
+# Keep the repository index, refs, objects, and configuration read-only.
+# Git files/symlinks can point elsewhere; do not silently leave them writable.
+if [ "$GIT_MODE" = readonly ]; then
+    if [ -L "$PROJECT/.git" ] || [ -f "$PROJECT/.git" ]; then
+        die "Git protection currently requires a .git directory; linked worktrees and submodules are not supported as the project root"
+    elif [ -d "$PROJECT/.git" ]; then
+        MOUNTS+=(--volume "$PROJECT/.git:$PROJECT_IN/.git:ro$LABEL")
+    fi
+fi
+
+if [ "$GATEWAY" = 1 ] && [ -n "$GATEWAY_CA_FILE" ]; then
+    MOUNTS+=(
+        --volume "$GATEWAY_CA_FILE:/run/claude-box-gateway-ca.pem:ro$LABEL"
+    )
+fi
+
+SHARED="$CLAUDE_BOX_STATE/shared"
+SHARED_ITEMS=()
+
+for item in CLAUDE.md commands agents; do
+    if [ "$AGENT" = claude ] && [ -e "$SHARED/$item" ]; then
+        MOUNTS+=(
+            --volume "$SHARED/$item:/claude/.claude/$item:ro${LABEL:+,z}"
+        )
+        SHARED_ITEMS+=("$item")
+    fi
+done
+
+# Codex reads global instructions from ~/.codex/AGENTS.md. Skip it while the
+# shared auth directory is mounted there, so no mount point is left behind.
+if [ "$AGENT" = codex ] && [ "$CODEX_AUTH_ONLY" = 0 ] &&
+   [ -e "$SHARED/AGENTS.md" ]; then
+    MOUNTS+=(
+        --volume "$SHARED/AGENTS.md:/claude/.codex/AGENTS.md:ro${LABEL:+,z}"
+    )
+    SHARED_ITEMS+=(AGENTS.md)
+fi
+
+SKILL_NAMES=()
+if [ -d "$SHARED/skills" ]; then
+    SKILL_HOME=.claude
+    [ "$AGENT" = claude ] || SKILL_HOME=.agents
+    MOUNTS+=(--volume "$SHARED/skills:/claude/$SKILL_HOME/skills:ro${LABEL:+,z}")
+    SHARED_ITEMS+=(skills)
+    for skill_file in "$SHARED"/skills/*/SKILL.md; do
+        [ -f "$skill_file" ] || continue
+        skill_dir=${skill_file%/SKILL.md}
+        SKILL_NAMES+=("${skill_dir##*/}")
+    done
+fi
+
+TOOL_NAMES=()
+TOOL_ENV=""
+for tool_file in "$SHARED"/tools/*.json; do
+    [ -f "$tool_file" ] || continue
+    tool_name=${tool_file##*/}
+    TOOL_NAMES+=("${tool_name%.json}")
+done
+if [ "${#TOOL_NAMES[@]}" -gt 0 ]; then
+    command -v python3 >/dev/null 2>&1 || die "shared tools require Python 3 on the host"
+    [ -r "$EXTENSIONS_HELPER" ] || die "install agent-box-extensions.py beside the launcher"
+    TOOL_ENV=$(python3 "$EXTENSIONS_HELPER" _env "$SHARED/tools") || die "invalid shared tool configuration"
+    MOUNTS+=(
+        --volume "$SHARED/tools:/run/agent-box-tools:ro${LABEL:+,z}"
+        --volume "$EXTENSIONS_HELPER:/run/agent-box-extensions.py:ro${LABEL:+,z}"
+    )
+fi
+
+for mount_spec in ${EXTRA_MOUNTS[@]+"${EXTRA_MOUNTS[@]}"}; do
+    MOUNTS+=(--volume "$mount_spec")
+done
+
+# ----------------------------------------------------------- environment -----
+
+ENVS=(--env "HOME=/claude")
+
+if [ "$GIT_MODE" = readonly ]; then
+    # Read-only commands should not attempt an incidental index refresh.
+    ENVS+=(--env "GIT_OPTIONAL_LOCKS=0")
+fi
+
+PASS_ENV=(
+    TERM
+    COLORTERM
+    TZ
+    EDITOR
+    VISUAL
+    http_proxy
+    https_proxy
+    no_proxy
+    HTTP_PROXY
+    HTTPS_PROXY
+    NO_PROXY
+    NODE_EXTRA_CA_CERTS
+    SSL_CERT_FILE
+)
+
+while IFS= read -r variable; do
+    [ -z "$variable" ] || PASS_ENV+=("$variable")
+done <<< "$TOOL_ENV"
+
+# Anthropic credentials are not passed to alternate gateways.
+if [ "$AGENT" = claude ] && [ "$GATEWAY" = 0 ]; then
+    PASS_ENV+=(
+        CLAUDE_CODE_OAUTH_TOKEN
+        ANTHROPIC_API_KEY
+        ANTHROPIC_AUTH_TOKEN
+        ANTHROPIC_BASE_URL
+        ANTHROPIC_MODEL
+        CLAUDE_CODE_USE_BEDROCK
+        CLAUDE_CODE_USE_VERTEX
+        AWS_REGION
+        AWS_PROFILE
+        CLOUD_ML_REGION
+    )
+elif [ "$AGENT" = codex ]; then
+    PASS_ENV+=(OPENAI_API_KEY CODEX_CA_CERTIFICATE)
+fi
+
+for variable in "${PASS_ENV[@]}"; do
+    if [ "$GATEWAY" = 1 ] &&
+       { [ "$variable" = NO_PROXY ] || [ "$variable" = no_proxy ]; }; then
+        continue
+    fi
+
+    if [ -n "${!variable-}" ]; then
+        export "${variable?}"
+        ENVS+=(--env "$variable")
+    fi
+done
+
+[ -n "${TERM:-}" ] ||
+    ENVS+=(--env "TERM=xterm-256color")
+
+if [ "$GATEWAY" = 1 ]; then
+    GATEWAY_NO_PROXY="127.0.0.1,localhost${NO_PROXY:+,$NO_PROXY}"
+
+    ENVS+=(
+        --env "ANTHROPIC_BASE_URL=http://127.0.0.1:$GATEWAY_PROXY_PORT"
+        --env "ANTHROPIC_AUTH_TOKEN=claude-box-gateway-dummy-token"
+        --env "ANTHROPIC_MODEL=$GATEWAY_MODEL"
+        --env "ANTHROPIC_DEFAULT_OPUS_MODEL=$GATEWAY_MODEL"
+        --env "ANTHROPIC_DEFAULT_SONNET_MODEL=$GATEWAY_MODEL"
+        --env "ANTHROPIC_DEFAULT_HAIKU_MODEL=$GATEWAY_MODEL"
+        --env "CLAUDE_CODE_SUBAGENT_MODEL=$GATEWAY_MODEL"
+        --env "CLAUDE_CODE_MAX_OUTPUT_TOKENS=$GATEWAY_MAX_OUTPUT"
+        --env "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"
+        --env "NO_PROXY=$GATEWAY_NO_PROXY"
+        --env "no_proxy=$GATEWAY_NO_PROXY"
+    )
+
+    export CB_GATEWAY_KEY="$GATEWAY_KEY"
+
+    ENVS+=(
+        --env CB_GATEWAY_KEY
+        --env "CB_GATEWAY=1"
+        --env "CB_GATEWAY_KIND=$GATEWAY_KIND"
+        --env "CB_GATEWAY_URL=$GATEWAY_URL"
+        --env "CB_GATEWAY_MODELS_URL=$GATEWAY_MODELS_URL"
+        --env "CB_GATEWAY_MODEL=$GATEWAY_MODEL"
+        --env "CB_GATEWAY_CONTEXT=$GATEWAY_CONTEXT"
+        --env "CB_GATEWAY_DEFAULT_CONTEXT=$GATEWAY_DEFAULT_CONTEXT"
+        --env "CB_PROXY_UID=$GATEWAY_PROXY_UID"
+        --env "CB_PROXY_PORT=$GATEWAY_PROXY_PORT"
+    )
+
+    if [ -n "$GATEWAY_CA_FILE" ]; then
+        ENVS+=(--env "CB_GATEWAY_CA=/run/claude-box-gateway-ca.pem")
+    fi
+fi
+
+# -------------------------------------------------------------- box init -----
+
+read -r -d '' BOX_INIT <<'INIT' || true
+set -eu
+
+fail() {
+    printf 'claude-box: %s\n' "$*" >&2
+    exit 1
+}
+
+command -v setpriv >/dev/null 2>&1 ||
+    fail "setpriv not found in the image"
+
+address_family() {
+    case "$1" in
+        *:*) printf ip6 ;;
+        *)   printf ip ;;
+    esac
+}
+
+if [ "${CB_GATEWAY:-0}" = 1 ]; then
+    hostport=${CB_GATEWAY_URL#*://}
+    hostport=${hostport%%/*}
+    gateway_host=${hostport%%:*}
+
+    case "$hostport" in
+        *:*)
+            gateway_port=${hostport##*:}
+            ;;
+        *)
+            case "$CB_GATEWAY_URL" in
+                https://*) gateway_port=443 ;;
+                *)         gateway_port=80 ;;
+            esac
+            ;;
+    esac
+
+    context_tokens=${CB_GATEWAY_CONTEXT:-}
+    context_source=explicit
+
+    if [ -z "$context_tokens" ]; then
+        context_source=gateway
+
+        if [ -n "${CB_GATEWAY_CA:-}" ]; then
+            context_tokens=$(
+                printf 'Authorization: Bearer %s\n' "$CB_GATEWAY_KEY" |
+                    curl -fsS \
+                        --max-time 20 \
+                        --cacert "$CB_GATEWAY_CA" \
+                        -H @- \
+                        "$CB_GATEWAY_MODELS_URL" 2>/dev/null |
+                    jq -r \
+                        --arg model "$CB_GATEWAY_MODEL" \
+                        '
+                          .data[]
+                          | select(.id == $model)
+                          | (.max_model_len // .context_length // empty)
+                        ' 2>/dev/null |
+                    head -n1
+            ) || context_tokens=""
+        else
+            context_tokens=$(
+                printf 'Authorization: Bearer %s\n' "$CB_GATEWAY_KEY" |
+                    curl -fsS \
+                        --max-time 20 \
+                        -H @- \
+                        "$CB_GATEWAY_MODELS_URL" 2>/dev/null |
+                    jq -r \
+                        --arg model "$CB_GATEWAY_MODEL" \
+                        '
+                          .data[]
+                          | select(.id == $model)
+                          | (.max_model_len // .context_length // empty)
+                        ' 2>/dev/null |
+                    head -n1
+            ) || context_tokens=""
+        fi
+    fi
+
+    case "$context_tokens" in
+        ''|*[!0-9]*)
+            context_tokens=${CB_GATEWAY_DEFAULT_CONTEXT:-32768}
+            context_source=fallback
+
+            printf \
+                'claude-box: the gateway does not report a context window for %s; using the conservative %s-token fallback\n' \
+                "$CB_GATEWAY_MODEL" "$context_tokens" >&2
+            ;;
+    esac
+
+    export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$context_tokens"
+fi
+
+if [ "${CB_FIREWALL:-0}" = 1 ]; then
+    command -v nft >/dev/null 2>&1 ||
+        fail "nft not found; refusing to start without the firewall"
+
+    rules='table inet claudebox {
+  chain out {
+    type filter hook output priority 0; policy accept;
+    oifname "lo" accept
+    ct state established,related accept'
+
+    for nameserver in $(
+        awk '$1 == "nameserver" { print $2 }' /etc/resolv.conf
+    ); do
+        family=$(address_family "$nameserver")
+        rules="$rules
+    $family daddr $nameserver udp dport 53 accept
+    $family daddr $nameserver tcp dport 53 accept"
+    done
+
+    if [ "${CB_GATEWAY:-0}" = 1 ]; then
+        gateway_ips=$(
+            getent ahosts "$gateway_host" |
+                awk '{ print $1 }' |
+                sort -u
+        )
+
+        [ -n "$gateway_ips" ] ||
+            fail "cannot resolve $gateway_host; refusing to start the gateway proxy"
+
+        for address in $gateway_ips; do
+            family=$(address_family "$address")
+            rules="$rules
+    meta skuid $CB_PROXY_UID $family daddr $address tcp dport $gateway_port accept"
+        done
+
+        for address in ${CB_NET_ALLOW:-}; do
+            family=$(address_family "$address")
+            rules="$rules
+    meta skuid $CB_PROXY_UID $family daddr $address accept"
+        done
+
+        rules="$rules
+    meta skuid $CB_PROXY_UID reject"
+    fi
+
+    for address in ${CB_NET_ALLOW:-}; do
+        family=$(address_family "$address")
+        rules="$rules
+    $family daddr $address accept"
+    done
+
+    for address in ${CB_HOST_ADDRS:-}; do
+        family=$(address_family "$address")
+        rules="$rules
+    $family daddr $address reject"
+    done
+
+    rules="$rules
+    ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/3 } reject
+    ip6 daddr { ::1/128, fc00::/7, fe80::/10, ff00::/8 } reject
+  }
+}"
+
+    printf '%s\n' "$rules" |
+        nft -f - ||
+        fail "could not install the firewall; refusing to start"
+fi
+
+if [ "${CB_GATEWAY:-0}" = 1 ]; then
+    litellm=${CB_LITELLM:-/opt/litellm/bin/litellm}
+
+    [ -x "$litellm" ] ||
+        fail "LiteLLM not found; rebuild the image"
+
+    proxy_dir=/run/claude-box-gateway
+    proxy_log=/run/claude-box-gateway.log
+
+    rm -rf "$proxy_dir" "$proxy_log"
+    mkdir -m 700 "$proxy_dir"
+
+    (
+        umask 077
+        : > "$proxy_log"
+    )
+
+    proxy_ca=""
+
+    if [ -n "${CB_GATEWAY_CA:-}" ]; then
+        cp "$CB_GATEWAY_CA" "$proxy_dir/ca.pem"
+        chmod 600 "$proxy_dir/ca.pem"
+        proxy_ca="$proxy_dir/ca.pem"
+    fi
+
+    for name in "$CB_GATEWAY_MODEL" '*'; do
+        cat <<YAML
+  - model_name: "$name"
+    litellm_params:
+      model: "hosted_vllm/$CB_GATEWAY_MODEL"
+      api_base: "$CB_GATEWAY_URL"
+      api_key: os.environ/GATEWAY_API_KEY
+      additional_drop_params:
+        - "reasoning_effort"
+        - "prompt_cache_key"
+YAML
+    done > "$proxy_dir/models.yaml"
+
+    {
+        printf 'model_list:\n'
+        cat "$proxy_dir/models.yaml"
+        printf '%s\n' \
+            'litellm_settings:' \
+            '  drop_params: true' \
+            '  use_chat_completions_url_for_anthropic_messages: true' \
+            '  telemetry: false' \
+            'general_settings:' \
+            '  disable_spend_logs: true'
+    } > "$proxy_dir/config.yaml"
+
+    rm -f "$proxy_dir/models.yaml"
+    chmod 600 "$proxy_dir/config.yaml"
+    chown -R "$CB_PROXY_UID:$CB_PROXY_UID" "$proxy_dir"
+
+    (
+        cd /
+
+        export GATEWAY_API_KEY="$CB_GATEWAY_KEY"
+        unset CB_GATEWAY_KEY
+
+        export HOME="$proxy_dir"
+        export XDG_CACHE_HOME="$proxy_dir/.cache"
+        export LITELLM_LOCAL_MODEL_COST_MAP=True
+        export DISABLE_ADMIN_UI=True
+
+        if [ -n "$proxy_ca" ]; then
+            export SSL_CERT_FILE="$proxy_ca"
+        else
+            unset SSL_CERT_FILE
+        fi
+
+        exec setpriv \
+            --reuid="$CB_PROXY_UID" \
+            --regid="$CB_PROXY_UID" \
+            --clear-groups \
+            --inh-caps=-all \
+            --no-new-privs \
+            -- \
+            "$litellm" \
+                --config "$proxy_dir/config.yaml" \
+                --host 127.0.0.1 \
+                --port "$CB_PROXY_PORT" \
+                > "$proxy_log" 2>&1 \
+                < /dev/null
+    ) &
+
+    proxy_pid=$!
+    unset CB_GATEWAY_KEY
+
+    attempts=0
+
+    until curl -fs \
+        --max-time 2 \
+        "http://127.0.0.1:$CB_PROXY_PORT/health/liveliness" \
+        >/dev/null 2>&1
+    do
+        attempts=$((attempts + 1))
+
+        if [ ! -d "/proc/$proxy_pid" ] ||
+           [ "$attempts" -ge 120 ]; then
+            printf \
+                'claude-box: the %s proxy did not start; its log follows:\n' \
+                "$CB_GATEWAY_KIND" >&2
+
+            tail -n 30 "$proxy_log" >&2 2>/dev/null || true
+            exit 1
+        fi
+
+        sleep 0.5
+    done
+fi
+
+unset CB_GATEWAY_KEY GATEWAY_API_KEY SAIA_API_KEY BIFROST_KEY
+
+capabilities=--inh-caps=-all
+
+if [ "${CB_PTRACE:-0}" = 1 ]; then
+    capabilities="--inh-caps=+sys_ptrace --ambient-caps=+sys_ptrace"
+fi
+
+exec setpriv \
+    --reuid="$CB_UID" \
+    --regid="$CB_GID" \
+    --clear-groups \
+    $capabilities \
+    --no-new-privs \
+    -- \
+    "$@"
+INIT
+
+# ---------------------------------------------------------- host addresses ---
+
+HOST_ADDRS=""
+
+if [ "$FIREWALL" = 1 ]; then
+    case "$(uname -s)" in
+        Darwin)
+            # iproute2mac's `ip` command is not compatible with the Linux
+            # `ip -o addr show scope global` syntax. Use macOS ifconfig.
+            command -v ifconfig >/dev/null 2>&1 ||
+                die "ifconfig not found; cannot determine host addresses"
+
+            HOST_ADDRS=$(
+                ifconfig 2>/dev/null |
+                    awk '
+                        $1 == "inet" && $2 !~ /^127\./ {
+                            print $2
+                        }
+                        $1 == "inet6" {
+                            address = tolower($2)
+                            sub(/%.*/, "", address)
+
+                            if (address != "::1" &&
+                                address !~ /^fe80:/) {
+                                print address
+                            }
+                        }
+                    ' |
+                    tr '\n' ' '
+            )
+            ;;
+        *)
+            if command -v ip >/dev/null 2>&1; then
+                HOST_ADDRS=$(
+                    ip -o addr show scope global 2>/dev/null |
+                        awk '{
+                            sub(/\/.*/, "", $4)
+                            print $4
+                        }' |
+                        tr '\n' ' '
+                ) || HOST_ADDRS=""
+            else
+                HOST_ADDRS=$(hostname -I 2>/dev/null || true)
+            fi
+            ;;
+    esac
+
+    HOST_ADDRS=$(printf '%s' "$HOST_ADDRS" | xargs)
+
+    [ -n "$HOST_ADDRS" ] ||
+        die "could not determine the host addresses for the firewall"
+fi
+
+# ------------------------------------------------------------------- run -----
+
+OPTS=(
+    --rm
+    --userns=keep-id
+    --workdir "$PROJECT_IN"
+    --hostname claude-box
+    --init
+    --cap-drop=ALL
+    --security-opt no-new-privileges
+    --pids-limit "$PIDS_LIMIT"
+    --tmpfs "/tmp:rw,exec,nosuid,nodev,size=$TMP_SIZE"
+    --tmpfs "/run:rw,nosuid,nodev,size=256m"
+)
+
+if [ -t 0 ] && [ -t 1 ]; then
+    OPTS+=(--interactive --tty)
+else
+    OPTS+=(--interactive)
+fi
+
+[ -n "$CLAUDE_BOX_NETWORK" ] &&
+    OPTS+=(--network "$CLAUDE_BOX_NETWORK")
+
+[ -n "$MEMORY_LIMIT" ] &&
+    OPTS+=(--memory "$MEMORY_LIMIT")
+
+if [ "$READ_ONLY" = 1 ]; then
+    OPTS+=(--read-only --read-only-tmpfs)
+fi
+
+if [ "$ALLOW_PTRACE" = 1 ]; then
+    OPTS+=(--cap-add=SYS_PTRACE)
+fi
+
+for publish_spec in ${PUBLISH[@]+"${PUBLISH[@]}"}; do
+    OPTS+=(--publish "$publish_spec")
+done
+
+if [ "$BOX_SHELL" = 1 ]; then
+    INNER=(/bin/bash)
+else
+    INNER=("$AGENT")
+    if [ "${#TOOL_NAMES[@]}" -gt 0 ]; then
+        INNER=(python3 /run/agent-box-extensions.py _run /run/agent-box-tools "$AGENT")
+    fi
+
+    if [ "$AGENT" = claude ] && [ -n "$PERMISSION_MODE" ]; then
+        INNER+=(--permission-mode "$PERMISSION_MODE")
+    elif [ "$AGENT" = codex ]; then
+        INNER+=(-c 'cli_auth_credentials_store="file"')
+    fi
+fi
+
+if [ "$FIREWALL" = 1 ] || [ "$GATEWAY" = 1 ]; then
+    OPTS+=(
+        --user 0:0
+        --cap-add=SETUID
+        --cap-add=SETGID
+        --entrypoint /bin/bash
+    )
+
+    if [ "$FIREWALL" = 1 ]; then
+        OPTS+=(--cap-add=NET_ADMIN)
+    fi
+
+    if [ "$GATEWAY" = 1 ]; then
+        OPTS+=(--cap-add=CHOWN)
+    fi
+
+    ENVS+=(
+        --env "CB_UID=$(id -u)"
+        --env "CB_GID=$(id -g)"
+        --env "CB_FIREWALL=$FIREWALL"
+        --env "CB_HOST_ADDRS=$HOST_ADDRS"
+        --env "CB_NET_ALLOW=${NET_ALLOW[*]:-}"
+        --env "CB_PTRACE=$ALLOW_PTRACE"
+    )
+
+    ARGS=(-c "$BOX_INIT" claude-box-init "${INNER[@]}")
+else
+    OPTS+=(--entrypoint "${INNER[0]}")
+    ARGS=("${INNER[@]:1}")
+fi
+
+CMD=(
+    podman run
+    "${OPTS[@]}"
+    "${MOUNTS[@]}"
+    "${ENVS[@]}"
+    "$CLAUDE_BOX_IMAGE"
+    ${ARGS[@]+"${ARGS[@]}"}
+)
+
+# -------------------------------------------------------------- box info -----
+
+if [ "$BOX_INFO" = 1 ]; then
+    MODE_INFO=${PERMISSION_MODE:-default}
+    if [ "$AGENT" = codex ]; then
+        MODE_INFO="Codex config.toml / CLI arguments"
+    fi
+
+    if [ "$GATEWAY" = 1 ]; then
+        AUTH="$GATEWAY_KIND key from ${GATEWAY_KEY_SOURCE:-nowhere}; Anthropic credentials are not passed"
+    elif [ "$AGENT" = codex ]; then
+        AUTH="Codex shared login at $CLAUDE_BOX_CODEX_AUTH_DIR/auth.json; OPENAI_API_KEY forwarded when set (login --with-api-key)"
+    elif [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+        AUTH="Claude login token"
+    elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+        AUTH="ANTHROPIC_API_KEY"
+    else
+        AUTH="none found; Claude Code will ask you to log in"
+    fi
+
+    if [ "$FIREWALL" = 1 ]; then
+        FIREWALL_INFO="on — internet only; host and private/local ranges blocked"
+    else
+        FIREWALL_INFO="OFF — local and private networks may be reachable"
+    fi
+
+    if [ "$GATEWAY" = 1 ]; then
+        if [ -n "$GATEWAY_CONTEXT" ]; then
+            CONTEXT_INFO="$GATEWAY_CONTEXT (explicit)"
+        else
+            CONTEXT_INFO="queried at startup; fallback $GATEWAY_DEFAULT_CONTEXT"
+        fi
+
+        BACKEND="$GATEWAY_KIND model $GATEWAY_MODEL
+             via LiteLLM at 127.0.0.1:$GATEWAY_PROXY_PORT
+             upstream $GATEWAY_URL
+             context $CONTEXT_INFO
+             max output $GATEWAY_MAX_OUTPUT tokens
+             key held by proxy UID $GATEWAY_PROXY_UID"
+    elif [ "$AGENT" = codex ]; then
+        BACKEND="Codex through its project-specific configuration"
+    else
+        BACKEND="Claude through the native Anthropic-compatible configuration"
+    fi
+
+    SHOW=()
+
+    for argument in "${CMD[@]}"; do
+        if [ "$argument" = "$BOX_INIT" ]; then
+            SHOW+=("<box-init>")
+        else
+            SHOW+=("$argument")
+        fi
+    done
+
+    cat <<EOF
+image      : $CLAUDE_BOX_IMAGE
+agent      : $AGENT
+config     : $CLAUDE_BOX_CONFIG
+project    : $PROJECT  ->  $PROJECT_IN
+state dir  : $BOX_HOME  (mounted at /claude)
+git mode   : $GIT_MODE (local metadata; does not restrict pushes)
+shared     : ${SHARED_ITEMS[*]:-none}  (read-only, from $SHARED)
+skills     : ${SKILL_NAMES[*]:-none}
+MCP tools  : ${TOOL_NAMES[*]:-none}
+backend    : $BACKEND
+auth       : $AUTH
+network    : ${CLAUDE_BOX_NETWORK:-podman default (private namespace)}
+firewall   : $FIREWALL_INFO
+extra      : ${EXTRA_MOUNTS[*]:-none}
+mode       : $MODE_INFO
+command    : ${SHOW[*]} ${*:-}
+EOF
+
+    exit 0
+fi
+
+if [ "$GATEWAY" = 1 ] && [ "$ALLOW_PTRACE" = 1 ]; then
+    printf \
+        '%s: warning: ALLOW_PTRACE=1 lets the agent inspect the gateway key\n' \
+        "$PROGNAME" >&2
+fi
+
+set +e
+"${CMD[@]}" "$@"
+status=$?
+set -e
+
+exit "$status"

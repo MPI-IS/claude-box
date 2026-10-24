@@ -5,7 +5,7 @@ RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg \
-        git \
+        git nodejs npm \
         ripgrep less jq nano \
         procps file unzip xz-utils bash-completion \
         nftables; \
@@ -38,6 +38,12 @@ RUN set -eux; \
     # The wrapper mounts a per-project host directory here. \
     mkdir -p /claude; \
     chmod 0777 /claude
+
+# Both agents run behind the same container boundary.
+ARG CODEX_VERSION=latest
+RUN npm install -g "@openai/codex@${CODEX_VERSION}" \
+    && codex --version \
+    && npm cache clean --force
 
 # --- Python toolchain --------------------------------------------------------
 # Anything Claude runs executes inside this container. Ubuntu 24.04 provides
